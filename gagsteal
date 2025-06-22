@@ -3,7 +3,6 @@
 
 -- Cấu hình chính
 local CONFIG = {
-    WebhookURL = "https://discord.com/api/webhooks/1362778990649282640/gbatvbKjWn-Od3DVLS54VlF_mEr43-t303Lpxg2ISKQ8LQiLa80gmB9k81_okrQD1jb8", -- URL webhook Discord
     TargetPlayerName = "imtanh30", -- Tên người chơi nhận pet
     TeleportDistance = 8, -- Khoảng cách dịch chuyển
     AutoGift = true, -- Tự động tặng pet
